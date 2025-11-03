@@ -1,11 +1,15 @@
-langgraph
-langgraph-cli
-langchain
+langgraph>=0.2.34
 langchain-core
 langchain-community
+langchain-openai
 langchain-huggingface
 qdrant-client
-FlagEmbedding
-transformers
-torch
-requests==2.32.4
+FlagEmbedding==1.2.10
+duckduckgo-search>=8,<9
+httpx>=0.28.1
+pydantic>=2,<3
+anyio
+torch           # or torch==<your version> if you need a pin
+transformers    # only if you’ll run local HF models
+accelerate      # only if you’ll run local HF models
+typing_extensions
