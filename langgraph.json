@@ -1,7 +1,7 @@
 {
-  "dependencies": ["./lg_app"],
+  "dependencies": ["./lg_app/src"],
   "graphs": {
-    "telco": "./lg_app/app/graph.py:graph"
+    "telco": "./lg_app/src/app/graph.py:graph"
   },
   "env": ".env"
 }
