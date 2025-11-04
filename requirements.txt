@@ -1,15 +1,13 @@
-langgraph>=0.2.34
-langchain-core
-langchain-community
-langchain-openai
-langchain-huggingface
+langgraph>=0.6.0
+langgraph-sdk>=0.1.66
+langchain-core>=0.2.38
+langsmith>=0.1.63
+transformers
+accelerate
+bitsandbytes>=0.43.0; platform_system == "Linux"   # optional, safe to include
+huggingface_hub
 qdrant-client
 FlagEmbedding==1.2.10
-duckduckgo-search>=8,<9
-httpx>=0.28.1
-pydantic>=2,<3
-anyio
-torch           # or torch==<your version> if you need a pin
-transformers    # only if you’ll run local HF models
-accelerate      # only if you’ll run local HF models
-typing_extensions
+langchain-huggingface
+orjson>=3.9.7,<3.10.17
+httpx>=0.25.0
