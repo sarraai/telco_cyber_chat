@@ -1,7 +1,20 @@
 {
-  "dependencies": ["./lg_app/src"],
+  "env": "./lg_app/.env",          // or remove if you set all vars in Studio
   "graphs": {
-    "telco": "./lg_app/src/app/graph.py:graph"
+    "telco": "./lg_app/app/graph.py:graph"
   },
-  "env": ".env"
+  "dependencies": [
+    "./lg_app",
+    "langgraph>=0.2.38",
+    "langgraph-api>=0.5.3",
+    "langchain-core>=1.0.3,<2",
+    "langchain-huggingface>=1.0.1",
+    "langchain-text-splitters>=1.0.0,<2",
+    "qdrant-client",
+    "FlagEmbedding==1.2.10",
+    "transformers>=4.45.0",
+    "accelerate>=0.34.0",
+    "huggingface_hub",
+    "protobuf>=6.33.0,<7"
+  ]
 }
