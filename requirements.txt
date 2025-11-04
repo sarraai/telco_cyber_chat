@@ -4,10 +4,9 @@ langchain-core>=0.2.38
 langsmith>=0.1.63
 transformers
 accelerate
-bitsandbytes>=0.43.0; platform_system == "Linux"   # optional, safe to include
+bitsandbytes>=0.43.0; platform_system == "Linux"
 huggingface_hub
 qdrant-client
 FlagEmbedding==1.2.10
-langchain-huggingface
 orjson>=3.9.7,<3.10.17
 httpx>=0.25.0
