@@ -24,7 +24,7 @@ try:
     from .llm_loader import generate_text, ask_secure
 except ImportError:
     # fallback if someone runs files directly without installing the package
-    from telco_cyber_chat.llm_loader import generate_text, ask_secure
+from telco_cyber_chat.llm_loader import generate_text, ask_secure
 
 
 # ===================== Config / Secrets =====================
@@ -573,5 +573,5 @@ state_graph.add_conditional_edges("self_ask_loop", route_selfask_loop, {"loop": 
 state_graph.add_edge("llm", END)
 
 # Export compiled graph for Studio
-graph = state_graph.compile()
+graph = build_graph()
 
