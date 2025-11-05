@@ -1,7 +1,7 @@
 {
   "env": "./.env",
   "graphs": {
-    "telco": "./src/telco_cyber_chat/graph.py:graph"
+    "telco": "telco_cyber_chat.graph:graph"
   },
   "dependencies": [
     ".",
