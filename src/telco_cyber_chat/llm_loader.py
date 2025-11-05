@@ -152,7 +152,7 @@ def get_client():
         ok2, _ = guard_post(out, role=role)
         return out if ok2 else refusal_message()
 
-else:
+
     # ---- Local transformers fallback (unchanged from your previous version) ----
     from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
 
