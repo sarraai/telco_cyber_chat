@@ -21,12 +21,10 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END, add_messages
 
 try:
+    from .llm_loader import generate_text, ask_secure
+except ImportError:
+    # fallback if someone runs files directly without installing the package
     from telco_cyber_chat.llm_loader import generate_text, ask_secure
-except Exception:
-    # fallback if Studio loads by file path
-    import sys, pathlib
-    sys.path.append(str(pathlib.Path(__file__).resolve().parent))
-    from llm_loader import generate_text, ask_secure
 
 
 # ===================== Config / Secrets =====================
