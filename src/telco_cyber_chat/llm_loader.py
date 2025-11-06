@@ -22,7 +22,10 @@ BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
 def _get_bge_client() -> InferenceClient:
     if not HF_TOKEN:
         raise RuntimeError("HF_TOKEN env var is missing")
-    return InferenceClient(provider="auto", api_key=HF_TOKEN)
+    return InferenceClient(
+        base_url="https://router.huggingface.co/hf-inference",
+        api_key=HF_TOKEN
+    )
 
 def bge_sentence_similarity(source: str, candidates: List[str], model: str = BGE_MODEL_ID) -> List[float]:
     """
@@ -201,6 +204,7 @@ if USE_REMOTE:
 # -----------------------------------------------------------------------------
 else:
     from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
+    import torch
     import json
 
     def _load(repo_id: str, prefer_4bit: bool = True):
