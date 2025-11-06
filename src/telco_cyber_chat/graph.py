@@ -369,7 +369,7 @@ def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents (each does internal hybrid retrieval) =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
+If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
 But any format is allowed; I will parse heuristically.
 
 User:
