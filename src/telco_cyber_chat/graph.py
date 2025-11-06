@@ -30,6 +30,10 @@ try:
 except ImportError:
     from telco_cyber_chat.llm_loader import generate_text, ask_secure, bge_sentence_similarity
 
+try:
+    from langchain_huggingface import ChatHuggingFace
+except ImportError:
+    from langchain_community.chat_models import ChatHuggingFace
 
 # ===================== Config / Secrets =====================
 QDRANT_URL        = os.getenv("QDRANT_URL")
