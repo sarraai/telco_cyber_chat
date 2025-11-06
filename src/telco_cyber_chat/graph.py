@@ -384,7 +384,7 @@ def _ctx_snips(docs: List[Document], cap: int = 3, width: int = 300) -> str:
     return "\n---\n".join(chunks) if chunks else "(none)"
 
 # ---- Heuristic parser: tolerate non-JSON and code fences ----
-_ACTION_RE = re.compile(r'"?\baction\b"?\s*:\s*"?([A-Za-z_ -]+)"?', re.I)
+_ACTION_RE = re.compile(r'"?\baction\b"?\s*:\s*"?([A-Za-z_ \-]+)"?', re.I)
 _QUERY_RE  = re.compile(r'"?\bquery\b"?\s*:\s*"([^"]+)"', re.I | re.S)
 _CODEBLOCK = re.compile(r"```(?:json)?(.*?)```", re.S)
 
@@ -418,7 +418,9 @@ def react_loop_node(state: ChatState) -> Dict:
     action, subq_extracted = _extract_action_query(raw)
 
     # Hard defaults to avoid KeyError no matter what the model returns
-    action = action or "search"
+    action = (action or "search").strip().lower()
+    if action not in ("search", "finish"):
+        action = "search"
     subq   = (subq_extracted or q).strip() or q
 
     # Ensure at least one hop; and if first step & not 'search', force 'search'
