@@ -16,6 +16,11 @@ from langchain_core.messages import HumanMessage, AIMessage, AnyMessage
 # LangGraph
 from langgraph.graph import StateGraph, START, END, MessagesState
 
+# 🔧 NEW: chat LLM + prompt + parser for orchestrator
+from langchain_huggingface import ChatHuggingFace
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
 # HF Inference for remote embeddings
 from huggingface_hub import InferenceClient
 
@@ -37,6 +42,13 @@ DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "it_specialist")
 
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("LLM_TOKEN")
 BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
+
+# 🔧 NEW: model id for orchestrator chat wrapper (fallback to REMOTE_MODEL_ID)
+ORCH_MODEL_ID = (
+    os.getenv("HF_MODEL_ID")
+    or os.getenv("REMOTE_MODEL_ID")
+    or "fdtn-ai/Foundation-Sec-8B-Instruct"
+)
 
 # Orchestration knobs
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "3"))
@@ -103,7 +115,7 @@ qdrant = _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
 _ = qdrant.scroll(collection_name=QDRANT_COLLECTION, limit=1, with_payload=False)
 
 
-# ===================== Lightweight LLM helper =====================
+# ===================== Lightweight LLM helper (used by agents, not orchestrator) =====================
 def _llm(prompt: str, max_new_tokens: int = 192) -> str:
     return generate_text(
         prompt,
@@ -217,29 +229,43 @@ class ChatState(MessagesState):
     eval: Dict[str, Any]
     trace: List[str]
 
+# 🔧 NEW: robust coercion to avoid list.strip errors
+
+def _coerce_str(x: Any) -> str:
+    if isinstance(x, str):
+        return x
+    if isinstance(x, list):
+        return "\n".join(_coerce_str(e) for e in x if e is not None)
+    if x is None:
+        return ""
+    return str(x)
+
 def _last_user(state: "ChatState") -> str:
     for msg in reversed(state.get("messages", [])):
         if isinstance(msg, HumanMessage):
-            return (msg.content or "").strip()
-    return (state.get("query") or "").strip()
+            return _coerce_str(getattr(msg, "content", "")).strip()
+    return _coerce_str(state.get("query", "")).strip()
+
 
 def _fmt_ctx(docs: List[Document], cap: int = 12) -> str:
     out = []
     for i, d in enumerate(docs[:cap], 1):
         did = d.metadata.get("doc_id") or d.metadata.get("source") or f"doc{i}"
-        chunk = (d.page_content or "").strip()
+        chunk = _coerce_str(d.page_content).strip()
         out.append(f"[{did}] {chunk[:1200]}")
     return "\n\n".join(out) if out else "No context."
+
 
 def _apply_rerank_for_query(docs: List[Document], q: str, keep: int = RERANK_KEEP_TOPK) -> List[Document]:
     if not docs:
         return []
-    texts = [ (d.page_content or "")[:1024] for d in docs ]
+    texts = [ _coerce_str(d.page_content)[:1024] for d in docs ]
     scores = bge_sentence_similarity(q, texts)  # remote similarity/rerank
     ranked = sorted(zip(docs, scores), key=lambda t: float(t[1]), reverse=True)
     for d, s in ranked:
         d.metadata["rerank_score"] = float(s)
     return [d for d, _ in ranked][:keep]
+
 
 def _avg_rerank(docs: List[Document], k: int = 5) -> float:
     if not docs:
@@ -251,27 +277,59 @@ def _avg_rerank(docs: List[Document], k: int = 5) -> float:
             vals.append(float(s))
     return (sum(vals)/len(vals)) if vals else 0.0
 
+
 def _infer_role(intent: str) -> str:
     if intent == "policy": return "admin"
     if intent in ("diagnostic", "incident", "mitigation"): return "network_admin"
     return DEFAULT_ROLE
 
 
-# ===================== Orchestrator (classify & route) =====================
-CLASSIFY_PROMPT = (
-    "Classify the user query and return STRICT JSON:\n"
-    '{"intent":"informational|diagnostic|policy|general",'
-    '"clarity":"clear|vague|multi-hop|longform"}\n\n'
-    "User: {q}"
+# ===================== Orchestrator (classify & route) — CHAT WRAPPER =====================
+# 🔧 NEW: chat LLM for orchestrator with strict JSON output
+_orch_llm = ChatHuggingFace(
+    repo_id=ORCH_MODEL_ID,
+    model_kwargs={
+        "trust_remote_code": True,  # use model's chat_template
+        "temperature": 0.0,
+        "max_new_tokens": 256,
+        "repetition_penalty": 1.05,
+    },
 )
 
+# 🔧 NEW: chat prompt that forces STRICT JSON
+CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        (
+            "You are a strict classifier for a telecom-cyber RAG orchestrator.\n"
+            "Return ONLY a single JSON object with keys: intent, clarity.\n"
+            "intent ∈ {informational, diagnostic, policy, general}.\n"
+            "clarity ∈ {clear, vague, multi-hop, longform}.\n"
+            "No prose. No markdown. JSON only."
+        ),
+    ),
+    (
+        "human",
+        "User: {q}\n\nRespond with JSON now.",
+    ),
+])
+
+_orch_chain = CLASSIFY_CHAT_PROMPT | _orch_llm | StrOutputParser()
+
+# Utility: extract first JSON object from a string
+_JSON_RE = re.compile(r"\{[\s\S]*\}")
+
+
 def orchestrator_node(state: ChatState) -> Dict:
-    q = state["query"] if state.get("query") else _last_user(state)
+    q = state.get("query") or _last_user(state)
+    q = _coerce_str(q)
+
     try:
-        raw = _llm(CLASSIFY_PROMPT.format(q=q))
-        obj = json.loads(re.search(r"\{[\s\S]*\}", raw).group(0))
-        intent  = str(obj.get("intent","general")).lower()
-        clarity = str(obj.get("clarity","clear")).lower()
+        raw = _orch_chain.invoke({"q": q})  # raw is a string from StrOutputParser
+        m = _JSON_RE.search(raw)
+        obj = json.loads(m.group(0) if m else raw)
+        intent  = _coerce_str(obj.get("intent", "general")).lower()
+        clarity = _coerce_str(obj.get("clarity", "clear")).lower()
     except Exception:
         intent, clarity = "general", "clear"
 
@@ -281,7 +339,8 @@ def orchestrator_node(state: ChatState) -> Dict:
         "intent": intent,
         "clarity": clarity,
         "role": role,
-        "orch_steps": int(ev.get("orch_steps", 0)) + 1
+        "orch_model": ORCH_MODEL_ID,
+        "orch_steps": int(ev.get("orch_steps", 0)) + 1,
     })
 
     # Choose reasoning path
@@ -299,6 +358,7 @@ def orchestrator_node(state: ChatState) -> Dict:
         "eval": ev,
         "trace": state.get("trace", []) + [f"orchestrator(intent={intent},clarity={clarity},role={role})->{nxt}"],
     }
+
 
 def route_orchestrator(state: ChatState) -> str:
     clarity = (state.get("eval") or {}).get("clarity", "clear")
@@ -319,9 +379,11 @@ Snippets (trimmed):
 {snips}
 """.strip()
 
+
 def _ctx_snips(docs: List[Document], cap: int = 3, width: int = 300) -> str:
-    chunks = [ (d.page_content or "")[:width] for d in (docs or [])[:cap] ]
+    chunks = [ _coerce_str(d.page_content)[:width] for d in (docs or [])[:cap] ]
     return "\n---\n".join(chunks) if chunks else "(none)"
+
 
 def react_loop_node(state: ChatState) -> Dict:
     q = state["query"]
@@ -337,7 +399,7 @@ def react_loop_node(state: ChatState) -> Dict:
         obj = {"action": "search", "query": q, "note": "fallback"}
 
     action = str(obj.get("action", "search")).lower()
-    subq = (obj.get("query") or "").strip() or q
+    subq = _coerce_str(obj.get("query", "")).strip() or q
 
     # Ensure at least one hop
     if (step < AGENT_MIN_STEPS) or (AGENT_FORCE_FIRST_SEARCH and step == 0 and action != "search"):
@@ -364,6 +426,7 @@ Decompose the user question into 2-4 minimal, ordered sub-questions for multi-ho
 Return a JSON list only.
 User: {question}
 """.strip()
+
 
 def self_ask_loop_node(state: ChatState) -> Dict:
     q = state["query"]
@@ -399,6 +462,7 @@ def self_ask_loop_node(state: ChatState) -> Dict:
 
 
 # ===================== Reranker (pass/fail gating) =====================
+
 def reranker_node(state: ChatState) -> Dict:
     q = state["query"]
     ev = dict(state.get("eval") or {})
@@ -433,6 +497,7 @@ def reranker_node(state: ChatState) -> Dict:
         "trace": state.get("trace", []) + [f"rerank(avg={avg_top:.3f}, keep={len(docs2)}) -> {decision}"],
     }
 
+
 def route_rerank(state: ChatState) -> str:
     ev = state.get("eval") or {}
     last = ev.get("last_agent", "react")
@@ -450,6 +515,7 @@ def route_rerank(state: ChatState) -> str:
 
 
 # ===================== LLM (final answer) =====================
+
 def llm_node(state: ChatState) -> Dict:
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
