@@ -12,14 +12,12 @@ from urllib.parse import urlparse, urlunparse
 # LangChain bits
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage, AnyMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda
 
 # LangGraph
 from langgraph.graph import StateGraph, START, END, MessagesState
-
-# 🔧 NEW: chat LLM + prompt + parser for orchestrator
-from langchain_huggingface import ChatHuggingFace
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 
 # HF Inference for remote embeddings
 from huggingface_hub import InferenceClient
@@ -29,11 +27,6 @@ try:
     from .llm_loader import generate_text, ask_secure, bge_sentence_similarity
 except ImportError:
     from telco_cyber_chat.llm_loader import generate_text, ask_secure, bge_sentence_similarity
-
-try:
-    from langchain_huggingface import ChatHuggingFace
-except ImportError:
-    from langchain_community.chat_models import ChatHuggingFace
 
 # ===================== Config / Secrets =====================
 QDRANT_URL        = os.getenv("QDRANT_URL")
@@ -47,7 +40,7 @@ DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "it_specialist")
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("LLM_TOKEN")
 BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
 
-# 🔧 NEW: model id for orchestrator chat wrapper (fallback to REMOTE_MODEL_ID)
+# Kept for metadata only (orchestration runs via generate_text)
 ORCH_MODEL_ID = (
     os.getenv("HF_MODEL_ID")
     or os.getenv("REMOTE_MODEL_ID")
@@ -94,6 +87,7 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
 
 # ===================== Remote BGE embeddings (no local weights) =====================
 _bge_client: Optional[InferenceClient] = None
+
 def _get_bge_client() -> InferenceClient:
     global _bge_client
     if _bge_client is None:
@@ -288,19 +282,8 @@ def _infer_role(intent: str) -> str:
     return DEFAULT_ROLE
 
 
-# ===================== Orchestrator (classify & route) — CHAT WRAPPER =====================
-# 🔧 NEW: chat LLM for orchestrator with strict JSON output
-_orch_llm = ChatHuggingFace(
-    repo_id=ORCH_MODEL_ID,
-    model_kwargs={
-        "trust_remote_code": True,  # use model's chat_template
-        "temperature": 0.0,
-        "max_new_tokens": 256,
-        "repetition_penalty": 1.05,
-    },
-)
-
-# 🔧 NEW: chat prompt that forces STRICT JSON
+# ===================== Orchestrator (classify & route) — via generate_text =====================
+# Chat prompt that forces STRICT JSON
 CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
@@ -318,7 +301,29 @@ CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
     ),
 ])
 
-_orch_chain = CLASSIFY_CHAT_PROMPT | _orch_llm | StrOutputParser()
+# Utility: flatten ChatMessages -> plain text prompt for generate_text
+
+def _messages_to_text(msgs) -> str:
+    parts = []
+    # allow PromptValue passthrough
+    if hasattr(msgs, "to_messages"):
+        msgs = msgs.to_messages()
+    for m in msgs:
+        role = getattr(m, "type", "user").upper()
+        parts.append(f"{role}:\n{_coerce_str(getattr(m, 'content', ''))}")
+    parts.append("ASSISTANT:")
+    return "\n\n".join(parts)
+
+_orch_chain = (
+    CLASSIFY_CHAT_PROMPT
+    | RunnableLambda(lambda pv: generate_text(
+        _messages_to_text(pv),
+        max_new_tokens=256,
+        temperature=0.0,
+        top_p=1.0
+    ))
+    | StrOutputParser()
+)
 
 # Utility: extract first JSON object from a string
 _JSON_RE = re.compile(r"\{[\s\S]*\}")
