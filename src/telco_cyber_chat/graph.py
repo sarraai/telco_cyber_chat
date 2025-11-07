@@ -382,7 +382,7 @@ def orchestrator_node(state: ChatState) -> Dict:
     q = state.get("query") or _last_user(state)
     q = _coerce_str(q)
 
-    # --- Early exit for greetings/goobyes (answer directly in orchestrator)
+    # --- Early exit for greetings/goodbyes: answer here and stop graph
     if _is_greeting(q):
         msg = GREETING_REPLY
         ev = dict(state.get("eval") or {})
@@ -438,7 +438,7 @@ def orchestrator_node(state: ChatState) -> Dict:
     }
 
 def route_orchestrator(state: ChatState) -> str:
-    # If orchestrator already answered (greeting/goodbye), go straight to final
+    # If orchestrator already answered (greeting/goodbye), end immediately
     if (state.get("eval") or {}).get("preanswered") or (state.get("answer") or ""):
         return "final"
     clarity = (state.get("eval") or {}).get("clarity", "clear")
@@ -633,7 +633,7 @@ state_graph.add_edge(START, "orchestrator")
 state_graph.add_conditional_edges("orchestrator", route_orchestrator, {
     "react": "react_loop",
     "self_ask": "self_ask_loop",
-    "final": "llm",   # allows direct finalize after greeting/goodbye
+    "final": END,   # <— end immediately after orchestrator for greeting/goodbye
 })
 state_graph.add_edge("react_loop", "rerank")
 state_graph.add_edge("self_ask_loop", "rerank")
