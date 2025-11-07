@@ -1,5 +1,7 @@
 # src/telco_cyber_chat/llm_loader.py
-import os, re, numpy as np
+import os
+import re
+import numpy as np
 from functools import lru_cache
 from typing import List
 from huggingface_hub import InferenceClient
@@ -8,9 +10,21 @@ from huggingface_hub import InferenceClient
 # Global config
 # -----------------------------------------------------------------------------
 USE_REMOTE = os.getenv("USE_REMOTE_HF", "true").lower() == "true"
+
+# HF router (OpenAI-compatible) base
 REMOTE_BASE = os.getenv("HF_BASE_URL", "https://router.huggingface.co/v1")
-REMOTE_MODEL_ID = os.getenv("REMOTE_MODEL_ID", "fdtn-ai/Foundation-Sec-8B-Instruct")
-REMOTE_GUARD_ID = os.getenv("REMOTE_GUARD_ID", "meta-llama/Llama-Guard-3-8B")
+
+# Pin both generator and guard to featherless-ai by default
+REMOTE_MODEL_ID = os.getenv("REMOTE_MODEL_ID", "fdtn-ai/Foundation-Sec-8B-Instruct:featherless-ai")
+REMOTE_GUARD_ID = os.getenv("REMOTE_GUARD_ID", "meta-llama/Llama-Guard-3-8B:featherless-ai")
+
+# Force a specific provider everywhere unless overridden
+HF_PROVIDER = os.getenv("HF_PROVIDER", "featherless-ai")
+# Keep guard on the same provider as generator (true by default)
+HF_ALIGN_GUARD_PROVIDER = os.getenv("HF_ALIGN_GUARD_PROVIDER", "true").lower() == "true"
+# Optional: allow streaming; we’ll buffer tokens so callers still get a string
+HF_STREAM = os.getenv("HF_STREAM", "false").lower() == "true"
+
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("LLM_TOKEN")
 
 # -----------------------------------------------------------------------------
@@ -22,10 +36,8 @@ BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
 def _get_bge_client() -> InferenceClient:
     if not HF_TOKEN:
         raise RuntimeError("HF_TOKEN env var is missing")
-    return InferenceClient(
-        base_url="https://router.huggingface.co/hf-inference",
-        api_key=HF_TOKEN
-    )
+    # Let InferenceClient pick the right HF endpoints; don't hardcode /hf-inference
+    return InferenceClient(api_key=HF_TOKEN)
 
 def bge_sentence_similarity(source: str, candidates: List[str], model: str = BGE_MODEL_ID) -> List[float]:
     """
@@ -34,18 +46,19 @@ def bge_sentence_similarity(source: str, candidates: List[str], model: str = BGE
     """
     client = _get_bge_client()
     try:
-        # Fast path (if the backend supports the task for the chosen model)
         return client.sentence_similarity(
             {"source_sentence": source, "sentences": candidates},
             model=model,
         )
     except Exception:
-        # Fallback: embed + cosine similarity (works with BGE-M3 on HF Inference)
+        # Fallback: embed + cosine similarity
         def l2(v): return v / (np.linalg.norm(v, axis=-1, keepdims=True) + 1e-12)
         s = np.array(client.feature_extraction(source, model=model))
         C = np.array(client.feature_extraction(candidates, model=model))
-        if s.ndim == 1: s = s[0][None, :] if s.size and isinstance(s[0], (list, np.ndarray)) else s[None, :]
-        if C.ndim == 1: C = C[None, :]
+        if s.ndim == 1:
+            s = s[0][None, :] if s.size and isinstance(s[0], (list, np.ndarray)) else s[None, :]
+        if C.ndim == 1:
+            C = C[None, :]
         s, C = l2(s)[0], l2(C)
         return (C @ s).tolist()
 
@@ -54,39 +67,68 @@ def bge_sentence_similarity(source: str, candidates: List[str], model: str = BGE
 # -----------------------------------------------------------------------------
 if USE_REMOTE:
     from openai import OpenAI
-    import json
 
     _client = None
+
+    def _normalize_base(url: str) -> str:
+        base = (url or "").rstrip("/")
+        return base if base.endswith("/v1") else base + "/v1"
+
+    def _with_provider(mid: str, provider: str) -> str:
+        """Attach/replace provider suffix '<repo>:<provider>'."""
+        return f"{(mid or '').split(':', 1)[0]}:{provider}"
 
     def get_client():
         global _client
         if _client is None:
-            _client = OpenAI(base_url=REMOTE_BASE, api_key=HF_TOKEN)
+            if not HF_TOKEN:
+                raise RuntimeError("HF_TOKEN env var is missing")
+            _client = OpenAI(base_url=_normalize_base(REMOTE_BASE), api_key=HF_TOKEN)
         return _client
 
     @lru_cache(maxsize=1)
     def _get_gen_model_id():
-        return REMOTE_MODEL_ID
+        # Force generator to HF_PROVIDER (default featherless-ai)
+        return _with_provider(REMOTE_MODEL_ID, HF_PROVIDER)
 
     @lru_cache(maxsize=1)
     def _get_guard_model_id():
+        # Keep guard on the same provider unless explicitly disabled
+        if HF_ALIGN_GUARD_PROVIDER:
+            return _with_provider(REMOTE_GUARD_ID, HF_PROVIDER)
+        # Otherwise ensure *some* provider is present
+        if ":" not in (REMOTE_GUARD_ID or ""):
+            return _with_provider(REMOTE_GUARD_ID, HF_PROVIDER)
         return REMOTE_GUARD_ID
 
     def generate_text(prompt: str, **decoding) -> str:
-        # map a few decoding args if present
         client = get_client()
         max_tokens = int(decoding.get("max_new_tokens", 512))
         temperature = float(decoding.get("temperature", 0.0))
         top_p = float(decoding.get("top_p", 1.0))
-        r = client.chat.completions.create(
+
+        resp = client.chat.completions.create(
             model=_get_gen_model_id(),
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            stream=False,
+            stream=HF_STREAM,
         )
-        return (r.choices[0].message.content or "").strip()
+
+        if not HF_STREAM:
+            return (resp.choices[0].message.content or "").strip()
+
+        # Streamed mode: buffer tokens so callers still get a single string
+        parts = []
+        for ev in resp:
+            try:
+                delta = ev.choices[0].delta.content
+                if delta:
+                    parts.append(delta)
+            except Exception:
+                pass
+        return "".join(parts).strip()
 
     # ---------- LlamaGuard + role-adaptive prompt ----------
     POLICY = {
@@ -193,7 +235,7 @@ if USE_REMOTE:
             temperature=float(preset_vals["temperature"]),
             top_p=float(preset_vals["top_p"]),
             max_tokens=int(max_new_tokens),
-            stream=False,
+            stream=False,  # keep non-stream here; generate_text already supports streaming if enabled
         )
         out = (r.choices[0].message.content or "").strip()
         ok2, _ = guard_post(out, role=role)
@@ -205,7 +247,6 @@ if USE_REMOTE:
 else:
     from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
     import torch
-    import json
 
     def _load(repo_id: str, prefer_4bit: bool = True):
         tok_kw = {"token": HF_TOKEN} if HF_TOKEN else {}
@@ -219,44 +260,60 @@ else:
         mdl = None
         if use_gpu and prefer_4bit:
             try:
-                q4 = BitsAndBytesConfig(load_in_4bit=True,bnb_4bit_use_double_quant=True,
-                                        bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=compute_dtype)
-                mdl = AutoModelForCausalLM.from_pretrained(repo_id, device_map="auto",
-                                                           quantization_config=q4, low_cpu_mem_usage=True,
-                                                           trust_remote_code=False, **tok_kw)
+                q4 = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=compute_dtype
+                )
+                mdl = AutoModelForCausalLM.from_pretrained(
+                    repo_id, device_map="auto", quantization_config=q4,
+                    low_cpu_mem_usage=True, trust_remote_code=False, **tok_kw
+                )
             except Exception:
                 mdl = None
         if mdl is None and use_gpu:
             try:
                 q8 = BitsAndBytesConfig(load_in_8bit=True)
-                mdl = AutoModelForCausalLM.from_pretrained(repo_id, device_map="auto",
-                                                           quantization_config=q8, low_cpu_mem_usage=True,
-                                                           trust_remote_code=False, **tok_kw)
+                mdl = AutoModelForCausalLM.from_pretrained(
+                    repo_id, device_map="auto", quantization_config=q8,
+                    low_cpu_mem_usage=True, trust_remote_code=False, **tok_kw
+                )
             except Exception:
                 mdl = None
         if mdl is None and use_gpu:
             try:
-                mdl = AutoModelForCausalLM.from_pretrained(repo_id, device_map="auto", dtype="auto",
-                                                           low_cpu_mem_usage=True, trust_remote_code=False, **tok_kw)
+                mdl = AutoModelForCausalLM.from_pretrained(
+                    repo_id, device_map="auto", dtype="auto",
+                    low_cpu_mem_usage=True, trust_remote_code=False, **tok_kw
+                )
             except Exception:
                 mdl = None
         if mdl is None:
-            mdl = AutoModelForCausalLM.from_pretrained(repo_id, device_map={"": "cpu"},
-                                                       low_cpu_mem_usage=True, trust_remote_code=False, **tok_kw)
+            mdl = AutoModelForCausalLM.from_pretrained(
+                repo_id, device_map={"": "cpu"},
+                low_cpu_mem_usage=True, trust_remote_code=False, **tok_kw
+            )
         mdl.eval()
         return tok, mdl
 
     @lru_cache(maxsize=1)
     def _get_gen():
         tok, mdl = _load(os.getenv("MODEL_ID", "fdtn-ai/Foundation-Sec-8B-Instruct"), prefer_4bit=True)
-        return pipeline("text-generation", model=mdl, tokenizer=tok, do_sample=False, num_beams=1,
-                        top_p=1.0, max_new_tokens=512, return_full_text=False, pad_token_id=tok.pad_token_id)
+        return pipeline(
+            "text-generation", model=mdl, tokenizer=tok,
+            do_sample=False, num_beams=1, top_p=1.0,
+            max_new_tokens=512, return_full_text=False, pad_token_id=tok.pad_token_id
+        )
 
     @lru_cache(maxsize=1)
     def _get_guard():
         tok, mdl = _load(os.getenv("GUARD_ID", "meta-llama/Llama-Guard-3-8B"), prefer_4bit=True)
-        return pipeline("text-generation", model=mdl, tokenizer=tok, do_sample=False, num_beams=1,
-                        top_p=1.0, max_new_tokens=128, return_full_text=True, pad_token_id=tok.pad_token_id)
+        return pipeline(
+            "text-generation", model=mdl, tokenizer=tok,
+            do_sample=False, num_beams=1, top_p=1.0,
+            max_new_tokens=128, return_full_text=True, pad_token_id=tok.pad_token_id
+        )
 
     def generate_text(prompt: str, **decoding) -> str:
         gen = _get_gen()
@@ -357,10 +414,12 @@ else:
         prompt = build_prompt(question, context, role=role, defense_only=info.get("defense_only", False))
         preset_vals = SAMPLING_PRESETS.get(preset, SAMPLING_PRESETS["balanced"])
         gen = _get_gen()
-        out = gen(prompt,
-                  do_sample=False,
-                  num_beams=1,
-                  top_p=float(preset_vals["top_p"]),
-                  max_new_tokens=int(max_new_tokens))[0]["generated_text"].strip()
+        out = gen(
+            prompt,
+            do_sample=False,
+            num_beams=1,
+            top_p=float(preset_vals["top_p"]),
+            max_new_tokens=int(max_new_tokens)
+        )[0]["generated_text"].strip()
         ok2, _ = guard_post(out, role=role)
         return out if ok2 else refusal_message()
