@@ -415,15 +415,16 @@ else:
             return "Audience: executive/admin. 5-line summary: risk, impact, priority, owners.\n"
         return "Audience: general user. Be concise.\n"
 
-    def build_prompt(question:str, context:str, *, role:str="end_user", defense_only:bool=False)->str:
-        safety = ("Provide defensive mitigations only. Do NOT include exploit code, payloads, or targeting steps.\n"
-                  if defense_only else "")
-        return (f"{role_directive(role)}{safety}"
-                "You are a telecom-cybersecurity assistant.\n"
-                "- Stay within cybersecurity scope and product policy.\n"
-                "- Use ONLY the Context. If info is missing, reply: 'Not enough evidence in context.'\n"
-                "- Cite snippets with [D#]. No chain-of-thought. No sensitive data.\n\n"
-                f"Context:\n{context.strip()}\n\nQuestion:\n{question.strip()}\n\nAnswer:")
+   def build_prompt(question:str, context:str, *, role:str="end_user", defense_only:bool=False)->str:
+    safety = ("Provide defensive mitigations only. Do NOT include exploit code, payloads, or targeting steps.\n"
+              if defense_only else "")
+    
+    return (f"{role_directive(role)}{safety}"
+            "You are a telecom-cybersecurity assistant.\n"
+            "- Answer using BOTH the provided context AND your cybersecurity knowledge.\n\n"
+            f"Context from Database:\n{context.strip()}\n\n"
+            f"Question:\n{question.strip()}\n\n"
+            "Answer:")
 
     SAMPLING_PRESETS = {
         "factual":  {"temperature": 0.3, "top_p": 0.9},
