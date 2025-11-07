@@ -387,14 +387,19 @@ def _infer_role(intent: str) -> str:
     return DEFAULT_ROLE
 
 # ===================== Orchestrator (classify & route) =====================
+# FIXED: Updated prompt to explicitly detect greetings/goodbyes
 CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
         (
             "You are a strict classifier for a telecom-cyber RAG orchestrator.\n"
             "Return ONLY a single JSON object with keys: intent, clarity.\n"
-            "intent ∈ {informational, diagnostic, policy, general}.\n"
-            "clarity ∈ {clear, vague, multi-hop, longform}.\n"
+            "intent ∈ {greeting, goodbye, informational, diagnostic, policy, general}.\n"
+            "clarity ∈ {clear, vague, multi-hop, longform}.\n\n"
+            "CRITICAL RULES:\n"
+            "- If the user just says hi/hello/hey/greetings → intent='greeting', clarity='clear'\n"
+            "- If the user just says bye/goodbye/thanks → intent='goodbye', clarity='clear'\n"
+            "- Greetings and goodbyes should NEVER be classified as 'general' or 'informational'\n\n"
             "No prose. No markdown. JSON only."
         ),
     ),
@@ -428,11 +433,11 @@ def orchestrator_node(state: ChatState) -> Dict:
     q = state.get("query") or _last_user(state)
     q = _coerce_str(q).strip()
     
-    # CRITICAL: Check greeting/goodbye FIRST before any processing
     log.info(f"[ORCHESTRATOR] Received query: '{q}'")
     
+    # FIXED: Check regex FIRST before calling LLM (fast path)
     if _is_greeting(q):
-        log.info(f"[ORCHESTRATOR] ✓ GREETING detected - returning immediately WITHOUT search")
+        log.info(f"[ORCHESTRATOR] ✓ GREETING detected via regex - returning immediately")
         return {
             "query": q,
             "intent": "greeting",
@@ -440,11 +445,11 @@ def orchestrator_node(state: ChatState) -> Dict:
             "messages": [AIMessage(content=GREETING_REPLY)],
             "answer": GREETING_REPLY,
             "docs": [],
-            "trace": ["orchestrator(greeting)->SKIP_ALL"]
+            "trace": ["orchestrator(greeting_regex)->SKIP_ALL"]
         }
     
     if _is_goodbye(q):
-        log.info(f"[ORCHESTRATOR] ✓ GOODBYE detected - returning immediately WITHOUT search")
+        log.info(f"[ORCHESTRATOR] ✓ GOODBYE detected via regex - returning immediately")
         return {
             "query": q,
             "intent": "goodbye",
@@ -452,20 +457,47 @@ def orchestrator_node(state: ChatState) -> Dict:
             "messages": [AIMessage(content=GOODBYE_REPLY)],
             "answer": GOODBYE_REPLY,
             "docs": [],
-            "trace": ["orchestrator(goodbye)->SKIP_ALL"]
+            "trace": ["orchestrator(goodbye_regex)->SKIP_ALL"]
         }
 
-    # Normal classification for non-greetings
-    log.info(f"[ORCHESTRATOR] Not a greeting/goodbye - proceeding with RAG pipeline")
+    # If regex didn't catch it, use LLM classification
+    log.info(f"[ORCHESTRATOR] Not a greeting/goodbye - proceeding with LLM classification")
     try:
         raw = _orch_chain.invoke({"q": q})
         m = _JSON_RE.search(raw)
         obj = json.loads(m.group(0) if m else raw)
         intent  = _coerce_str(obj.get("intent", "general")).lower()
         clarity = _coerce_str(obj.get("clarity", "clear")).lower()
-    except Exception:
+    except Exception as e:
+        log.warning(f"[ORCHESTRATOR] Classification failed: {e}")
         intent, clarity = "general", "clear"
 
+    # FIXED: Handle LLM-detected greetings/goodbyes (backup layer)
+    if intent == "greeting":
+        log.info(f"[ORCHESTRATOR] ✓ GREETING detected via LLM classification")
+        return {
+            "query": q,
+            "intent": "greeting",
+            "eval": {"intent": "greeting", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True},
+            "messages": [AIMessage(content=GREETING_REPLY)],
+            "answer": GREETING_REPLY,
+            "docs": [],
+            "trace": ["orchestrator(greeting_llm)->SKIP_ALL"]
+        }
+    
+    if intent == "goodbye":
+        log.info(f"[ORCHESTRATOR] ✓ GOODBYE detected via LLM classification")
+        return {
+            "query": q,
+            "intent": "goodbye",
+            "eval": {"intent": "goodbye", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True},
+            "messages": [AIMessage(content=GOODBYE_REPLY)],
+            "answer": GOODBYE_REPLY,
+            "docs": [],
+            "trace": ["orchestrator(goodbye_llm)->SKIP_ALL"]
+        }
+
+    # Normal RAG processing
     role = _infer_role(intent)
     ev = dict(state.get("eval") or {})
     ev.update({
@@ -742,3 +774,14 @@ def chat_with_greeting_check(
         "trace": [],
     }
     return graph.invoke(initial_state)
+
+# ===================== LangSmith-compatible entry point =====================
+def invoke(query: str, messages: Optional[List[AnyMessage]] = None, **kwargs) -> Dict[str, Any]:
+    """
+    LangSmith-compatible entry point that includes greeting fast-path.
+    This wrapper ensures greetings/goodbyes are handled before RAG pipeline.
+    """
+    return chat_with_greeting_check(query, messages)
+
+# Make the wrapper the default callable for LangSmith
+__all__ = ["invoke", "chat_with_greeting_check", "graph"]
