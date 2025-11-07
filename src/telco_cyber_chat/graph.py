@@ -73,6 +73,7 @@ RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))
 # --- Greeting / Goodbye (English only) ---
 GREETING_REPLY = "Hello! I'm your telecom-cybersecurity assistant."
 GOODBYE_REPLY  = "Goodbye!"
+# FIXED: More precise regex that matches ENTIRE string (not just start)
 _GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
 _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
 
@@ -214,6 +215,7 @@ def _search_dense(q: str, k: int):
         return resp.points
     except Exception as e1:
         log.debug(f"Named dense search failed: {e1}")
+    
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
@@ -223,6 +225,7 @@ def _search_dense(q: str, k: int):
         return resp.points
     except Exception as e2:
         log.debug(f"Unnamed dense search failed: {e2}")
+    
     try:
         return qdrant.search(
             collection_name=QDRANT_COLLECTION,
@@ -231,6 +234,7 @@ def _search_dense(q: str, k: int):
         )
     except Exception as e3:
         log.debug(f"Tuple dense search failed: {e3}")
+    
     try:
         return qdrant.search(
             collection_name=QDRANT_COLLECTION,
@@ -257,6 +261,7 @@ def _search_sparse(q: str, k: int):
         return resp.points
     except Exception as e1:
         log.debug(f"Named sparse search failed: {e1}")
+    
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
@@ -266,6 +271,7 @@ def _search_sparse(q: str, k: int):
         return resp.points
     except Exception as e2:
         log.debug(f"Unnamed sparse search failed: {e2}")
+    
     try:
         resp = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
@@ -387,12 +393,8 @@ CLASSIFY_CHAT_PROMPT = ChatPromptTemplate.from_messages([
         (
             "You are a strict classifier for a telecom-cyber RAG orchestrator.\n"
             "Return ONLY a single JSON object with keys: intent, clarity.\n"
-            "intent ∈ {greeting, goodbye, informational, diagnostic, policy, general}.\n"
-            "clarity ∈ {clear, vague, multi-hop, longform}.\n\n"
-            "CRITICAL RULES:\n"
-            "- If the user just says hi/hello/hey/greetings → intent='greeting', clarity='clear'\n"
-            "- If the user just says bye/goodbye/thanks → intent='goodbye', clarity='clear'\n"
-            "- Greetings and goodbyes should NEVER be classified as 'general' or 'informational'\n\n"
+            "intent ∈ {informational, diagnostic, policy, general}.\n"
+            "clarity ∈ {clear, vague, multi-hop, longform}.\n"
             "No prose. No markdown. JSON only."
         ),
     ),
@@ -426,11 +428,11 @@ def orchestrator_node(state: ChatState) -> Dict:
     q = state.get("query") or _last_user(state)
     q = _coerce_str(q).strip()
     
+    # CRITICAL: Check greeting/goodbye FIRST before any processing
     log.info(f"[ORCHESTRATOR] Received query: '{q}'")
     
-    # Check regex FIRST before calling LLM (fast path)
     if _is_greeting(q):
-        log.info(f"[ORCHESTRATOR] ✓ GREETING detected via regex - returning immediately")
+        log.info(f"[ORCHESTRATOR] ✓ GREETING detected - returning immediately WITHOUT search")
         return {
             "query": q,
             "intent": "greeting",
@@ -438,11 +440,11 @@ def orchestrator_node(state: ChatState) -> Dict:
             "messages": [AIMessage(content=GREETING_REPLY)],
             "answer": GREETING_REPLY,
             "docs": [],
-            "trace": ["orchestrator(greeting_regex)->SKIP_ALL"]
+            "trace": ["orchestrator(greeting)->SKIP_ALL"]
         }
     
     if _is_goodbye(q):
-        log.info(f"[ORCHESTRATOR] ✓ GOODBYE detected via regex - returning immediately")
+        log.info(f"[ORCHESTRATOR] ✓ GOODBYE detected - returning immediately WITHOUT search")
         return {
             "query": q,
             "intent": "goodbye",
@@ -450,47 +452,20 @@ def orchestrator_node(state: ChatState) -> Dict:
             "messages": [AIMessage(content=GOODBYE_REPLY)],
             "answer": GOODBYE_REPLY,
             "docs": [],
-            "trace": ["orchestrator(goodbye_regex)->SKIP_ALL"]
+            "trace": ["orchestrator(goodbye)->SKIP_ALL"]
         }
 
-    # If regex didn't catch it, use LLM classification
-    log.info(f"[ORCHESTRATOR] Not a greeting/goodbye - proceeding with LLM classification")
+    # Normal classification for non-greetings
+    log.info(f"[ORCHESTRATOR] Not a greeting/goodbye - proceeding with RAG pipeline")
     try:
         raw = _orch_chain.invoke({"q": q})
         m = _JSON_RE.search(raw)
         obj = json.loads(m.group(0) if m else raw)
         intent  = _coerce_str(obj.get("intent", "general")).lower()
         clarity = _coerce_str(obj.get("clarity", "clear")).lower()
-    except Exception as e:
-        log.warning(f"[ORCHESTRATOR] Classification failed: {e}")
+    except Exception:
         intent, clarity = "general", "clear"
 
-    # Handle LLM-detected greetings/goodbyes (backup layer)
-    if intent == "greeting":
-        log.info(f"[ORCHESTRATOR] ✓ GREETING detected via LLM classification")
-        return {
-            "query": q,
-            "intent": "greeting",
-            "eval": {"intent": "greeting", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True},
-            "messages": [AIMessage(content=GREETING_REPLY)],
-            "answer": GREETING_REPLY,
-            "docs": [],
-            "trace": ["orchestrator(greeting_llm)->SKIP_ALL"]
-        }
-    
-    if intent == "goodbye":
-        log.info(f"[ORCHESTRATOR] ✓ GOODBYE detected via LLM classification")
-        return {
-            "query": q,
-            "intent": "goodbye",
-            "eval": {"intent": "goodbye", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True},
-            "messages": [AIMessage(content=GOODBYE_REPLY)],
-            "answer": GOODBYE_REPLY,
-            "docs": [],
-            "trace": ["orchestrator(goodbye_llm)->SKIP_ALL"]
-        }
-
-    # Normal RAG processing
     role = _infer_role(intent)
     ev = dict(state.get("eval") or {})
     ev.update({
@@ -511,12 +486,17 @@ def orchestrator_node(state: ChatState) -> Dict:
     }
 
 def route_orchestrator(state: ChatState) -> str:
+    """
+    CRITICAL FIX: Check skip_rag flag to bypass entire pipeline for greetings/goodbyes
+    """
     ev = state.get("eval") or {}
     
+    # If skip_rag is set (greeting/goodbye), go directly to END
     if ev.get("skip_rag"):
         log.info("[ROUTE] skip_rag=True -> going to END immediately")
         return "end"
     
+    # Otherwise route based on clarity
     clarity = ev.get("clarity", "clear")
     route = "react" if clarity == "clear" else "self_ask"
     log.info(f"[ROUTE] clarity={clarity} -> {route}")
@@ -525,11 +505,7 @@ def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-
-CRITICAL: If the user input is just a greeting (hi, hello, hey, greetings) or goodbye (bye, goodbye, farewell), respond EXACTLY:
-{"action":"finish","query":"GREETING","note":"User is just greeting, no search needed"}
-
-Otherwise, if you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
+If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
 But any format is allowed; I will parse heuristically.
 
 User:
@@ -579,18 +555,6 @@ def react_loop_node(state: ChatState) -> Dict:
         action = "search"
     subq = (subq_extracted or q).strip() or q
 
-    # If agent detected greeting, mark as finish and skip search
-    if subq.upper() == "GREETING" or action == "finish":
-        log.info(f"[REACT] Agent detected greeting/finish - skipping search")
-        ev["react_step"] = step + 1
-        ev["last_agent"] = "react"
-        ev["react_detected_greeting"] = True
-        return {
-            "docs": docs,
-            "eval": ev,
-            "trace": state.get("trace", []) + [f"react_step({step} GREETING_DETECTED) -> skip_search"]
-        }
-
     if (step < AGENT_MIN_STEPS) or (AGENT_FORCE_FIRST_SEARCH and step == 0 and action != "search"):
         action = "search"
 
@@ -610,12 +574,7 @@ def react_loop_node(state: ChatState) -> Dict:
 
 SELFASK_PLAN_PROMPT = """
 Decompose the user question into 2-4 minimal, ordered sub-questions for multi-hop reasoning.
-
-CRITICAL: If the user input is just a greeting (hi, hello, hey) or goodbye (bye, farewell), respond EXACTLY:
-["GREETING"]
-
-Otherwise, return a JSON list of sub-questions only.
-
+Return a JSON list only.
 User: {question}
 """.strip()
 
@@ -636,19 +595,7 @@ def self_ask_loop_node(state: ChatState) -> Dict:
         ev["selfask_subqs"] = subqs
         idx = 0
 
-    subq = subqs[min(idx, max(0, len(subqs)-1))].strip()
-
-    # NEW: if planner returned GREETING/bye, skip retrieval entirely
-    if subq.upper() == "GREETING" or _is_greeting(subq) or _is_goodbye(subq):
-        ev["selfask_idx"] = idx + 1
-        ev["last_agent"] = "self_ask"
-        ev["selfask_detected_greeting"] = True
-        return {
-            "docs": docs,
-            "eval": ev,
-            "trace": state.get("trace", []) + [f"self_ask_step({idx} GREETING_DETECTED) -> skip_search"]
-        }
-
+    subq = subqs[min(idx, max(0, len(subqs)-1))]
     hop_docs = hybrid_search(subq, top_k=AGENT_TOPK_PER_STEP)
     docs = docs + hop_docs
 
@@ -758,7 +705,6 @@ graph = state_graph.compile()
 def chat_with_greeting_check(
     query: str,
     messages: Optional[List[AnyMessage]] = None,
-    **kwargs
 ) -> Dict[str, Any]:
     """
     Main entry point with fast-path for greetings/goodbyes.
@@ -795,15 +741,4 @@ def chat_with_greeting_check(
         "messages": base_msgs + [HumanMessage(content=q)],
         "trace": [],
     }
-    return graph.invoke(initial_state, **kwargs)
-
-# ===================== LangSmith-compatible entry point =====================
-def invoke(query: str, messages: Optional[List[AnyMessage]] = None, **kwargs) -> Dict[str, Any]:
-    """
-    LangSmith-compatible entry point that includes greeting fast-path.
-    This wrapper ensures greetings/goodbyes are handled before RAG pipeline.
-    """
-    return chat_with_greeting_check(query, messages, **kwargs)
-
-# Make the wrapper the default callable for LangSmith
-__all__ = ["invoke", "chat_with_greeting_check", "graph"]
+    return graph.invoke(initial_state)
