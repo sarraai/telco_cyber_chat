@@ -28,6 +28,30 @@ HF_STREAM = os.getenv("HF_STREAM", "false").lower() == "true"
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("LLM_TOKEN")
 
 # -----------------------------------------------------------------------------
+# Small-talk guard (prevents canned telco bullets on greetings/thanks)
+# -----------------------------------------------------------------------------
+GREETING_REPLY = os.getenv("GREETING_REPLY", "Hello! I'm your telecom-cybersecurity assistant.")
+GOODBYE_REPLY  = os.getenv("GOODBYE_REPLY", "Goodbye!")
+
+# Strict whole-line match so only bare greetings short-circuit
+_GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
+_BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
+_THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx)\s*[!.?]*\s*$", re.I)
+
+def _smalltalk_reply(text: str):
+    t = (text or "").strip()
+    if _GREET_RE.search(t):
+        return GREETING_REPLY
+    if _BYE_RE.search(t):
+        return GOODBYE_REPLY
+    if _THANKS_RE.search(t):
+        return "You're welcome!"
+    # Extremely short non-question → treat as small talk
+    if len(re.findall(r"\w+", t)) <= 2 and not t.endswith("?"):
+        return GREETING_REPLY
+    return None
+
+# -----------------------------------------------------------------------------
 # BGE similarity via HF Inference (no local weights, no downloads on import)
 # -----------------------------------------------------------------------------
 BGE_MODEL_ID = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
@@ -223,6 +247,11 @@ if USE_REMOTE:
 
     def ask_secure(question: str, *, context: str = "", role: str = "end_user",
                    max_new_tokens: int = 400, preset: str = "balanced", seed: int | None = None) -> str:
+        # ---- Small-talk fast path (short-circuit) ----
+        st = _smalltalk_reply(question)
+        if st is not None:
+            return st
+
         client = get_client()
         ok, info = guard_pre(question, role=role)
         if not ok:
@@ -408,6 +437,11 @@ else:
 
     def ask_secure(question: str, *, context: str = "", role: str = "end_user",
                    max_new_tokens: int = 400, preset: str = "balanced", seed: int | None = None) -> str:
+        # ---- Small-talk fast path (short-circuit) ----
+        st = _smalltalk_reply(question)
+        if st is not None:
+            return st
+
         ok, info = guard_pre(question, role=role)
         if not ok:
             return refusal_message()
