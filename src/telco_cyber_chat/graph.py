@@ -20,8 +20,8 @@ from langchain_core.runnables import RunnableLambda
 # LangGraph
 from langgraph.graph import StateGraph, START, END, MessagesState
 
-# BGE-M3 (dense+sparse)
-from FlagEmbedding import BGEM3FlagModel
+# --- HF Inference for remote BGE dense + our sparse lexicalizer (no local weights)
+from huggingface_hub import InferenceClient
 
 # Remote helpers (your LLM + HF sentence similarity)
 try:
@@ -45,12 +45,15 @@ DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "it_specialist")
 DENSE_NAME  = os.getenv("DENSE_FIELD", "dense")
 SPARSE_NAME = os.getenv("SPARSE_FIELD", "sparse")
 
-# BGE-M3
+# BGE-M3 (REMOTE dense; sparse via token2id or hashing fallback)
 BGE_MODEL_ID        = os.getenv("BGE_MODEL_ID", "BAAI/bge-m3")
-BGE_USE_FP16        = os.getenv("USE_FP16", "true").lower() == "true"
-BGE_TOKEN2ID_PATH   = os.getenv("BGE_TOKEN2ID_PATH", "").strip()  # strongly recommended
-SPARSE_MAX_TERMS    = int(os.getenv("SPARSE_MAX_TERMS", "256"))   # cap high-weight terms
-IDX_HASH_SIZE       = int(os.getenv("IDX_HASH_SIZE", str(2**20))) # fallback hashing buckets
+BGE_TOKEN2ID_PATH   = os.getenv("BGE_TOKEN2ID_PATH", "").strip()  # strongly recommended to match ingestion
+SPARSE_MAX_TERMS    = int(os.getenv("SPARSE_MAX_TERMS", "256"))
+IDX_HASH_SIZE       = int(os.getenv("IDX_HASH_SIZE", str(2**20)))  # must match ingestion if you used hashing
+
+# HF Inference client
+HF_TOKEN        = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+HF_INF_PROVIDER = os.getenv("HF_INF_PROVIDER", "").strip()  # optional (e.g., "hf-inference")
 
 # Kept for metadata only (orchestration runs via generate_text)
 ORCH_MODEL_ID = (
@@ -110,11 +113,24 @@ def _make_qdrant_client(url: str, api_key: Optional[str]) -> QdrantClient:
 qdrant = _make_qdrant_client(QDRANT_URL, QDRANT_API_KEY)
 _ = qdrant.scroll(collection_name=QDRANT_COLLECTION, limit=1, with_payload=False)
 
-# ===================== BGE-M3 query encoder (dense + sparse) =====================
+# ===================== Remote BGE dense + lexical sparse =====================
 @lru_cache(maxsize=1)
-def _get_bge() -> BGEM3FlagModel:
-    # Uses CPU/GPU automatically; fp16 when available
-    return BGEM3FlagModel(BGE_MODEL_ID, use_fp16=BGE_USE_FP16)
+def _get_hf_client() -> InferenceClient:
+    if not HF_TOKEN:
+        raise RuntimeError("HF token missing: set HF_TOKEN/HUGGINGFACEHUB_API_TOKEN in deployment environment.")
+    kw = dict(api_key=HF_TOKEN, timeout=60)
+    if HF_INF_PROVIDER:
+        kw["provider"] = HF_INF_PROVIDER  # e.g., "hf-inference" (optional)
+    return InferenceClient(**kw)
+
+def _embed_bge_remote(text: str) -> List[float]:
+    """
+    Feature-extract via HF Inference, then L2-normalize (float32).
+    """
+    arr = np.array(_get_hf_client().feature_extraction(text, model=BGE_MODEL_ID))
+    vec = arr if arr.ndim == 1 else arr[0]
+    n = np.linalg.norm(vec) + 1e-12
+    return (vec / n).astype("float32").tolist()
 
 @lru_cache(maxsize=1)
 def _get_token2id() -> Dict[str, int]:
@@ -122,9 +138,9 @@ def _get_token2id() -> Dict[str, int]:
         try:
             with open(BGE_TOKEN2ID_PATH, "r", encoding="utf-8") as f:
                 mapping = json.load(f)
-            # tolerate either {"token": id} or {"vocab": {"token": id}}
             if isinstance(mapping, dict) and "vocab" in mapping and isinstance(mapping["vocab"], dict):
                 mapping = mapping["vocab"]
+            # keys are tokens (strings), values are ints
             return {str(k): int(v) for k, v in mapping.items()}
         except Exception as e:
             log.warning(f"[BGE] Failed to load token2id at {BGE_TOKEN2ID_PATH}: {e}")
@@ -135,45 +151,66 @@ def _get_token2id() -> Dict[str, int]:
     )
     return {}
 
+_WORD_RE = re.compile(r"[A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)?", re.U)
+
+def _tokenize_query_simple(q: str) -> List[str]:
+    # Lightweight word-ish tokenizer; avoids downloading model tokenizers.
+    return [t.lower() for t in _WORD_RE.findall(q or "") if t.strip()]
+
 def _hash_idx(term: str) -> int:
     # Stable, cross-run bucket: sha1(term) mod IDX_HASH_SIZE
     h = hashlib.sha1(term.encode("utf-8", errors="ignore")).hexdigest()
     return int(h, 16) % IDX_HASH_SIZE
 
-def _encode_query_bge(q: str) -> Tuple[List[float], qmodels.SparseVector]:
+def _lexicalize_query(q: str) -> qmodels.SparseVector:
     """
-    Returns (dense_vec, sparse_vector) for a single query using BGE-M3.
-    Dense is L2-normalized. Sparse is top-N lexical weights mapped to indices.
+    Produce a sparse query vector compatible with your indexed field.
+    If token2id.json is provided (recommended), we map tokens -> ids.
+    Otherwise we use the same hashing fallback used at ingestion time.
+    Weights: normalized term frequency (sqrt tf), top-N capped.
     """
-    model = _get_bge()
-    out = model.encode_queries(
-        [q],
-        return_dense=True,
-        return_sparse=True,
-        normalize_to_unit=True,   # => dense already L2-normalized
-    )[0]
+    toks = _tokenize_query_simple(q)
+    if not toks:
+        return qmodels.SparseVector(indices=[], values=[])
 
-    dense_vec = out.get("dense_vecs", [])
-    lex = out.get("lexical_weights", {}) or {}
-    # Keep top-N by absolute weight
-    if SPARSE_MAX_TERMS > 0 and len(lex) > SPARSE_MAX_TERMS:
-        lex = dict(sorted(lex.items(), key=lambda kv: abs(kv[1]), reverse=True)[:SPARSE_MAX_TERMS])
+    # term frequencies
+    counts: Dict[str, int] = {}
+    for t in toks:
+        counts[t] = counts.get(t, 0) + 1
+    max_tf = max(counts.values())
+
+    # compute weights (sqrt tf / sqrt max_tf) to compress extremes
+    items = [(t, (counts[t] ** 0.5) / (max_tf ** 0.5 + 1e-9)) for t in counts]
+    # keep top-N terms
+    if SPARSE_MAX_TERMS > 0 and len(items) > SPARSE_MAX_TERMS:
+        items = sorted(items, key=lambda kv: kv[1], reverse=True)[:SPARSE_MAX_TERMS]
 
     token2id = _get_token2id()
     indices, values = [], []
     if token2id:
-        for tok, w in lex.items():
+        for tok, w in items:
             tid = token2id.get(tok)
             if tid is not None:
                 indices.append(int(tid))
                 values.append(float(w))
     else:
-        # hashing fallback
-        for tok, w in lex.items():
+        # hashing fallback — MUST match how you indexed documents
+        for tok, w in items:
             indices.append(_hash_idx(tok))
             values.append(float(w))
 
-    return dense_vec, qmodels.SparseVector(indices=indices, values=values)
+    return qmodels.SparseVector(indices=indices, values=values)
+
+def _encode_query_bge(q: str) -> Tuple[List[float], qmodels.SparseVector]:
+    """
+    Returns (dense_vec, sparse_vector) for a single query:
+      - dense_vec from HF Inference (BGE-M3 feature_extraction + L2 norm).
+      - sparse_vector from lexicalization (token2id if provided, else hashing).
+    This lets you keep hybrid retrieval without local BGE weights.
+    """
+    dense_vec = _embed_bge_remote(q)
+    sparse_vec = _lexicalize_query(q)
+    return dense_vec, sparse_vec
 
 # ===================== Retrieval =====================
 @dataclass
@@ -216,6 +253,11 @@ def _search_dense(q: str, k: int):
 
 def _search_sparse(q: str, k: int):
     _, sparse_vec = _encode_query_bge(q)
+
+    # If lexicalization happens to be empty, skip gracefully
+    if not getattr(sparse_vec, "indices", None):
+        return []
+
     # Prefer named sparse vector if your collection uses named sparse field
     try:
         resp = qdrant.query_points(
@@ -447,7 +489,7 @@ def route_orchestrator(state: ChatState) -> str:
 # ===================== Agents =====================
 REACT_STEP_PROMPT = """
 You are a ReAct telecom-cyber analyst. Output a suggestion for the next retrieval query.
-If you include JSON, prefer: {{"action":"search","query":"<short query>","note":"<why>"}}.
+If you include JSON, prefer: {"action":"search","query":"<short query>","note":"<why>"}.
 But any format is allowed; I will parse heuristically.
 
 User:
@@ -611,7 +653,7 @@ def llm_node(state: ChatState) -> Dict:
             "Troubleshooting:\n"
             "- Verify the collection has points (and correct payload keys)\n"
             f"- Ensure dense name='{DENSE_NAME}' and sparse name='{SPARSE_NAME}' match your collection\n"
-            "- Ensure embeddings match BGE-M3 (dense dim=1024) and sparse vocab mapping"
+            "- Ensure embeddings match BGE-M3 (dense dim=1024) and sparse vocab mapping or hashing size"
         )
         return {"messages":[AIMessage(content=msg)], "answer": msg,
                 "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"]}
