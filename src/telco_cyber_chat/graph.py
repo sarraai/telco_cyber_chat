@@ -700,3 +700,45 @@ state_graph.add_conditional_edges("rerank", route_rerank, {
 state_graph.add_edge("llm", END)
 
 graph = state_graph.compile()
+
+# ===================== APPROACH 1: Pre-graph fast path =====================
+def chat_with_greeting_check(
+    query: str,
+    messages: Optional[List[AnyMessage]] = None,
+) -> Dict[str, Any]:
+    """
+    Main entry point with fast-path for greetings/goodbyes.
+    Call this instead of directly invoking the graph.
+    """
+    q = (query or "").strip()
+    base_msgs = list(messages or [])
+
+    if _is_greeting(q):
+        return {
+            "messages": base_msgs + [HumanMessage(content=q), AIMessage(content=GREETING_REPLY)],
+            "answer": GREETING_REPLY,
+            "query": q,
+            "intent": "greeting",
+            "docs": [],
+            "eval": {"intent": "greeting", "preanswered": True},
+            "trace": ["fast_path_greeting"],
+        }
+
+    if _is_goodbye(q):
+        return {
+            "messages": base_msgs + [HumanMessage(content=q), AIMessage(content=GOODBYE_REPLY)],
+            "answer": GOODBYE_REPLY,
+            "query": q,
+            "intent": "goodbye",
+            "docs": [],
+            "eval": {"intent": "goodbye", "preanswered": True},
+            "trace": ["fast_path_goodbye"],
+        }
+
+    # Normal path: invoke graph for non-greetings
+    initial_state: Dict[str, Any] = {
+        "query": q,
+        "messages": base_msgs + [HumanMessage(content=q)],
+        "trace": [],
+    }
+    return graph.invoke(initial_state)
