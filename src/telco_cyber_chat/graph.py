@@ -73,14 +73,17 @@ RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))
 # --- Greeting / Goodbye (English only) ---
 GREETING_REPLY = "Hello! I'm your telecom-cybersecurity assistant."
 GOODBYE_REPLY  = "Goodbye!"
+
 # FIXED: More precise regex that matches ENTIRE string (not just start)
 _GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
 _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
 
 def _is_greeting(text: str) -> bool:
+    """CRITICAL: Must match entire string, not just start"""
     return bool(_GREET_RE.search(text or ""))
 
 def _is_goodbye(text: str) -> bool:
+    """CRITICAL: Must match entire string, not just start"""
     return bool(_BYE_RE.search(text or ""))
 
 # ===================== Qdrant helpers =====================
@@ -425,12 +428,16 @@ _orch_chain = (
 _JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
 def orchestrator_node(state: ChatState) -> Dict:
+    """
+    CRITICAL FIX: Check greeting/goodbye FIRST before any processing.
+    Returns immediately with skip_rag=True to bypass entire RAG pipeline.
+    """
     q = state.get("query") or _last_user(state)
     q = _coerce_str(q).strip()
     
-    # CRITICAL: Check greeting/goodbye FIRST before any processing
     log.info(f"[ORCHESTRATOR] Received query: '{q}'")
     
+    # CRITICAL: Check greeting/goodbye FIRST before any processing
     if _is_greeting(q):
         log.info(f"[ORCHESTRATOR] ✓ GREETING detected - returning immediately WITHOUT search")
         return {
@@ -487,7 +494,8 @@ def orchestrator_node(state: ChatState) -> Dict:
 
 def route_orchestrator(state: ChatState) -> str:
     """
-    CRITICAL FIX: Check skip_rag flag to bypass entire pipeline for greetings/goodbyes
+    CRITICAL FIX: Check skip_rag flag to bypass entire pipeline for greetings/goodbyes.
+    This is the SECOND line of defense after orchestrator_node.
     """
     ev = state.get("eval") or {}
     
@@ -654,9 +662,15 @@ def route_rerank(state: ChatState) -> str:
 
 # ===================== LLM (final answer) =====================
 def llm_node(state: ChatState) -> Dict:
+    """
+    FIXED: Handles both RAG queries and greetings gracefully.
+    For greetings, context will be empty and ask_secure will handle it naturally.
+    """
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
+    q = state["query"]
     
+    # If no docs found, provide helpful troubleshooting message
     if not docs:
         msg = (
             f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. I won't fabricate an answer.\n\n"
@@ -668,7 +682,8 @@ def llm_node(state: ChatState) -> Dict:
         return {"messages":[AIMessage(content=msg)], "answer": msg,
                 "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"]}
 
-    text = ask_secure(state["query"], context=_fmt_ctx(docs, cap=12), role=role,
+    # Normal RAG path: format context and call ask_secure
+    text = ask_secure(q, context=_fmt_ctx(docs, cap=12), role=role,
                       preset="factual", max_new_tokens=400)
     return {"messages": [AIMessage(content=text)], "answer": text, "trace": state.get("trace", []) + ["llm"]}
 
@@ -701,19 +716,25 @@ state_graph.add_edge("llm", END)
 
 graph = state_graph.compile()
 
-# ===================== APPROACH 1: Pre-graph fast path =====================
+# ===================== MAIN ENTRY POINT =====================
 def chat_with_greeting_check(
     query: str,
     messages: Optional[List[AnyMessage]] = None,
 ) -> Dict[str, Any]:
     """
-    Main entry point with fast-path for greetings/goodbyes.
-    Call this instead of directly invoking the graph.
+    CRITICAL: Main entry point with double-layer protection for greetings/goodbyes.
+    
+    Layer 1 (Fast Path): Pre-graph check - catches greetings before graph execution
+    Layer 2 (Graph Safety): orchestrator_node also checks and sets skip_rag flag
+    
+    This ensures greetings NEVER trigger RAG retrieval or LLM calls.
     """
     q = (query or "").strip()
     base_msgs = list(messages or [])
 
+    # Layer 1: Pre-graph fast path (first line of defense)
     if _is_greeting(q):
+        log.info("[FAST_PATH] Greeting detected - skipping graph entirely")
         return {
             "messages": base_msgs + [HumanMessage(content=q), AIMessage(content=GREETING_REPLY)],
             "answer": GREETING_REPLY,
@@ -725,6 +746,7 @@ def chat_with_greeting_check(
         }
 
     if _is_goodbye(q):
+        log.info("[FAST_PATH] Goodbye detected - skipping graph entirely")
         return {
             "messages": base_msgs + [HumanMessage(content=q), AIMessage(content=GOODBYE_REPLY)],
             "answer": GOODBYE_REPLY,
@@ -735,7 +757,8 @@ def chat_with_greeting_check(
             "trace": ["fast_path_goodbye"],
         }
 
-    # Normal path: invoke graph for non-greetings
+    # Layer 2: Normal path through graph (has built-in greeting detection too)
+    log.info("[NORMAL_PATH] Non-greeting query - invoking full RAG graph")
     initial_state: Dict[str, Any] = {
         "query": q,
         "messages": base_msgs + [HumanMessage(content=q)],
