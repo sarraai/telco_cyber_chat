@@ -1,4 +1,3 @@
-# src/telco_cyber_chat/llm_loader.py
 import os
 import re
 import numpy as np
@@ -22,7 +21,7 @@ REMOTE_GUARD_ID = os.getenv("REMOTE_GUARD_ID", "meta-llama/Llama-Guard-3-8B:feat
 HF_PROVIDER = os.getenv("HF_PROVIDER", "featherless-ai")
 # Keep guard on the same provider as generator (true by default)
 HF_ALIGN_GUARD_PROVIDER = os.getenv("HF_ALIGN_GUARD_PROVIDER", "true").lower() == "true"
-# Optional: allow streaming; we’ll buffer tokens so callers still get a string
+# Optional: allow streaming; we'll buffer tokens so callers still get a string
 HF_STREAM = os.getenv("HF_STREAM", "false").lower() == "true"
 
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("LLM_TOKEN")
@@ -33,12 +32,16 @@ HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.get
 GREETING_REPLY = os.getenv("GREETING_REPLY", "Hello! I'm your telecom-cybersecurity assistant.")
 GOODBYE_REPLY  = os.getenv("GOODBYE_REPLY", "Goodbye!")
 
-# Strict whole-line match so only bare greetings short-circuit
+# FIXED: More precise regex that matches ENTIRE string (not just start)
 _GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
 _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
 _THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx)\s*[!.?]*\s*$", re.I)
 
 def _smalltalk_reply(text: str):
+    """
+    CRITICAL: This must be called FIRST before any LLM processing.
+    Returns immediate reply for greetings/goodbyes, None otherwise.
+    """
     t = (text or "").strip()
     if _GREET_RE.search(t):
         return GREETING_REPLY
@@ -226,12 +229,26 @@ if USE_REMOTE:
         return "Audience: general user. Be concise.\n"
 
     def build_prompt(question:str, context:str, *, role:str="end_user", defense_only:bool=False)->str:
+        """
+        FIXED: Don't force context-only mode for greetings/small-talk.
+        Allow natural responses when context is empty or irrelevant.
+        """
+        # If no context provided, allow freeform response
+        if not context.strip():
+            return (f"{role_directive(role)}"
+                    "You are a telecom-cybersecurity assistant.\n"
+                    "Answer the question naturally and concisely.\n\n"
+                    f"Question:\n{question.strip()}\n\nAnswer:")
+        
+        # Normal RAG mode with context
         safety = ("Provide defensive mitigations only. Do NOT include exploit code, payloads, or targeting steps.\n"
                   if defense_only else "")
+        
         return (f"{role_directive(role)}{safety}"
                 "You are a telecom-cybersecurity assistant.\n"
-                "- Stay within cybersecurity scope and product policy.\n"
-                "- Use ONLY the Context. If info is missing, reply: 'Not enough evidence in context.'\n"
+                "- Use the Context when relevant to answer the question.\n"
+                "- For greetings or small-talk, respond naturally without forcing technical content.\n"
+                "- If the question requires specific info not in context, say: 'Not enough evidence in context.'\n"
                 "- Cite snippets with [D#]. No chain-of-thought. No sensitive data.\n\n"
                 f"Context:\n{context.strip()}\n\nQuestion:\n{question.strip()}\n\nAnswer:")
 
@@ -247,24 +264,30 @@ if USE_REMOTE:
 
     def ask_secure(question: str, *, context: str = "", role: str = "end_user",
                    max_new_tokens: int = 400, preset: str = "balanced", seed: int | None = None) -> str:
+        """
+        CRITICAL FIX: Small-talk check MUST happen FIRST, before any guards or LLM calls.
+        """
         # ---- Small-talk fast path (short-circuit) ----
         st = _smalltalk_reply(question)
         if st is not None:
             return st
 
+        # ---- Normal RAG flow ----
         client = get_client()
         ok, info = guard_pre(question, role=role)
         if not ok:
             return refusal_message()
+        
         prompt = build_prompt(question, context, role=role, defense_only=info.get("defense_only", False))
         preset_vals = SAMPLING_PRESETS.get(preset, SAMPLING_PRESETS["balanced"])
+        
         r = client.chat.completions.create(
             model=_get_gen_model_id(),
             messages=[{"role": "user", "content": prompt}],
             temperature=float(preset_vals["temperature"]),
             top_p=float(preset_vals["top_p"]),
             max_tokens=int(max_new_tokens),
-            stream=False,  # keep non-stream here; generate_text already supports streaming if enabled
+            stream=False,
         )
         out = (r.choices[0].message.content or "").strip()
         ok2, _ = guard_post(out, role=role)
@@ -416,11 +439,24 @@ else:
         return "Audience: general user. Be concise.\n"
 
     def build_prompt(question:str, context:str, *, role:str="end_user", defense_only:bool=False)->str:
+        """
+        FIXED: Allow natural responses when context is empty (greetings, etc.)
+        """
+        # If no context, allow freeform response
+        if not context.strip():
+            return (f"{role_directive(role)}"
+                    "You are a telecom-cybersecurity assistant.\n"
+                    "Answer the question naturally and concisely.\n\n"
+                    f"Question:\n{question.strip()}\n\nAnswer:")
+        
+        # Normal RAG mode
         safety = ("Provide defensive mitigations only. Do NOT include exploit code, payloads, or targeting steps.\n"
                   if defense_only else "")
+        
         return (f"{role_directive(role)}{safety}"
                 "You are a telecom-cybersecurity assistant.\n"
-                "- Answer using BOTH the provided context AND your cybersecurity knowledge.\n\n"
+                "- Answer using BOTH the provided context AND your cybersecurity knowledge.\n"
+                "- For greetings or small-talk, respond naturally.\n\n"
                 f"Context from Database:\n{context.strip()}\n\n"
                 f"Question:\n{question.strip()}\n\n"
                 "Answer:")
@@ -437,6 +473,9 @@ else:
 
     def ask_secure(question: str, *, context: str = "", role: str = "end_user",
                    max_new_tokens: int = 400, preset: str = "balanced", seed: int | None = None) -> str:
+        """
+        CRITICAL FIX: Small-talk MUST be checked FIRST.
+        """
         # ---- Small-talk fast path (short-circuit) ----
         st = _smalltalk_reply(question)
         if st is not None:
