@@ -28,8 +28,13 @@ try:
 except ImportError:
     from telco_cyber_chat.llm_loader import generate_text, ask_secure, bge_sentence_similarity
 
+# ===================== Logging Configuration =====================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.WARNING),
+    format='%(levelname)s: %(message)s'
+)
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 # ===================== Config / Secrets =====================
 QDRANT_URL        = os.getenv("QDRANT_URL")
@@ -70,21 +75,31 @@ AGENT_MIN_STEPS          = int(os.getenv("AGENT_MIN_STEPS", "1"))
 RERANK_KEEP_TOPK       = int(os.getenv("RERANK_KEEP_TOPK", "8"))
 RERANK_PASS_THRESHOLD  = float(os.getenv("RERANK_PASS_THRESHOLD", "0.25"))
 
-# --- Greeting / Goodbye (English only) ---
+# ===================== Greeting/Goodbye Detection =====================
 GREETING_REPLY = "Hello! I'm your telecom-cybersecurity assistant."
 GOODBYE_REPLY  = "Goodbye!"
+THANKS_REPLY   = "You're welcome!"
 
-# FIXED: More precise regex that matches ENTIRE string (not just start)
+# CRITICAL: Precise regex that matches ENTIRE string, not just start
 _GREET_RE = re.compile(r"^\s*(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\s*[!.?]*\s*$", re.I)
 _BYE_RE   = re.compile(r"^\s*(bye|goodbye|see\s+you|see\s+ya|thanks?\s*,?\s*bye|farewell)\s*[!.?]*\s*$", re.I)
+_THANKS_RE = re.compile(r"^\s*(thanks|thank\s+you|thx|ty)\s*[!.?]*\s*$", re.I)
 
 def _is_greeting(text: str) -> bool:
     """CRITICAL: Must match entire string, not just start"""
-    return bool(_GREET_RE.search(text or ""))
+    return bool(_GREET_RE.search((text or "").strip()))
 
 def _is_goodbye(text: str) -> bool:
     """CRITICAL: Must match entire string, not just start"""
-    return bool(_BYE_RE.search(text or ""))
+    return bool(_BYE_RE.search((text or "").strip()))
+
+def _is_thanks(text: str) -> bool:
+    """Check for thank you messages"""
+    return bool(_THANKS_RE.search((text or "").strip()))
+
+def _is_smalltalk(text: str) -> bool:
+    """Detect any small talk that should skip RAG"""
+    return _is_greeting(text) or _is_goodbye(text) or _is_thanks(text)
 
 # ===================== Qdrant helpers =====================
 def _normalize_qdrant_url(raw: str) -> str:
@@ -429,48 +444,102 @@ _JSON_RE = re.compile(r"\{[\s\S]*?\}")
 
 def orchestrator_node(state: ChatState) -> Dict:
     """
-    CRITICAL FIX: Check greeting/goodbye FIRST before any processing.
-    Returns immediately with skip_rag=True to bypass entire RAG pipeline.
+    CRITICAL FIXES:
+    1. Check greeting/goodbye FIRST before any LLM classification
+    2. Check for extremely short queries (1-2 words) and treat as small talk
+    3. Prevent ReAct from running on small talk
     """
     q = state.get("query") or _last_user(state)
     q = _coerce_str(q).strip()
     
     log.info(f"[ORCHESTRATOR] Received query: '{q}'")
     
-    # CRITICAL: Check greeting/goodbye FIRST before any processing
+    # ========== LAYER 1: Check small talk BEFORE LLM classification ==========
     if _is_greeting(q):
-        log.info(f"[ORCHESTRATOR] ✓ GREETING detected - returning immediately WITHOUT search")
+        log.info(f"[ORCHESTRATOR] ✅ GREETING detected - SKIP ALL processing")
         return {
             "query": q,
             "intent": "greeting",
-            "eval": {"intent": "greeting", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True},
+            "eval": {
+                "intent": "greeting", 
+                "clarity": "clear", 
+                "role": DEFAULT_ROLE, 
+                "skip_rag": True,
+                "skip_reason": "smalltalk_greeting"
+            },
             "messages": [AIMessage(content=GREETING_REPLY)],
             "answer": GREETING_REPLY,
             "docs": [],
-            "trace": ["orchestrator(greeting)->SKIP_ALL"]
+            "trace": ["orchestrator(greeting)->END"]
         }
     
     if _is_goodbye(q):
-        log.info(f"[ORCHESTRATOR] ✓ GOODBYE detected - returning immediately WITHOUT search")
+        log.info(f"[ORCHESTRATOR] ✅ GOODBYE detected - SKIP ALL processing")
         return {
             "query": q,
             "intent": "goodbye",
-            "eval": {"intent": "goodbye", "clarity": "clear", "role": DEFAULT_ROLE, "skip_rag": True},
+            "eval": {
+                "intent": "goodbye", 
+                "clarity": "clear", 
+                "role": DEFAULT_ROLE, 
+                "skip_rag": True,
+                "skip_reason": "smalltalk_goodbye"
+            },
             "messages": [AIMessage(content=GOODBYE_REPLY)],
             "answer": GOODBYE_REPLY,
             "docs": [],
-            "trace": ["orchestrator(goodbye)->SKIP_ALL"]
+            "trace": ["orchestrator(goodbye)->END"]
+        }
+    
+    if _is_thanks(q):
+        log.info(f"[ORCHESTRATOR] ✅ THANKS detected - SKIP ALL processing")
+        return {
+            "query": q,
+            "intent": "thanks",
+            "eval": {
+                "intent": "thanks", 
+                "clarity": "clear", 
+                "role": DEFAULT_ROLE, 
+                "skip_rag": True,
+                "skip_reason": "smalltalk_thanks"
+            },
+            "messages": [AIMessage(content=THANKS_REPLY)],
+            "answer": THANKS_REPLY,
+            "docs": [],
+            "trace": ["orchestrator(thanks)->END"]
         }
 
-    # Normal classification for non-greetings
-    log.info(f"[ORCHESTRATOR] Not a greeting/goodbye - proceeding with RAG pipeline")
+    # ========== LAYER 2: Check for extremely short queries ==========
+    # If query is 1-2 words and not a question, treat as small talk
+    word_count = len(re.findall(r'\w+', q))
+    if word_count <= 2 and not q.endswith('?'):
+        log.info(f"[ORCHESTRATOR] ⚠️ Very short query ({word_count} words) - treating as small talk")
+        return {
+            "query": q,
+            "intent": "smalltalk",
+            "eval": {
+                "intent": "smalltalk", 
+                "clarity": "clear", 
+                "role": DEFAULT_ROLE, 
+                "skip_rag": True,
+                "skip_reason": "too_short"
+            },
+            "messages": [AIMessage(content="I'm here to help with telecom and cybersecurity questions. What would you like to know?")],
+            "answer": "I'm here to help with telecom and cybersecurity questions. What would you like to know?",
+            "docs": [],
+            "trace": ["orchestrator(smalltalk_short)->END"]
+        }
+
+    # ========== LAYER 3: Normal classification for technical queries ==========
+    log.info(f"[ORCHESTRATOR] Technical query - proceeding with classification")
     try:
         raw = _orch_chain.invoke({"q": q})
         m = _JSON_RE.search(raw)
         obj = json.loads(m.group(0) if m else raw)
         intent  = _coerce_str(obj.get("intent", "general")).lower()
         clarity = _coerce_str(obj.get("clarity", "clear")).lower()
-    except Exception:
+    except Exception as e:
+        log.warning(f"[ORCHESTRATOR] Classification failed: {e}")
         intent, clarity = "general", "clear"
 
     role = _infer_role(intent)
@@ -481,6 +550,7 @@ def orchestrator_node(state: ChatState) -> Dict:
         "role": role,
         "orch_model": ORCH_MODEL_ID,
         "orch_steps": int(ev.get("orch_steps", 0)) + 1,
+        "skip_rag": False,  # Explicitly mark as NOT skipping
     })
 
     nxt = "react" if clarity == "clear" else "self_ask"
@@ -499,7 +569,7 @@ def route_orchestrator(state: ChatState) -> str:
     """
     ev = state.get("eval") or {}
     
-    # If skip_rag is set (greeting/goodbye), go directly to END
+    # If skip_rag is set (greeting/goodbye/thanks), go directly to END
     if ev.get("skip_rag"):
         log.info("[ROUTE] skip_rag=True -> going to END immediately")
         return "end"
@@ -545,11 +615,26 @@ def _extract_action_query(raw: str) -> Tuple[Optional[str], Optional[str]]:
     return action, query
 
 def react_loop_node(state: ChatState) -> Dict:
+    """
+    CRITICAL FIX: Add safety checks to prevent hallucinated queries.
+    1. Abort if small talk somehow reaches here
+    2. Validate extracted subquery has word overlap with original
+    3. Use original query if subquery seems hallucinated
+    """
     q = state["query"]
     ev = dict(state.get("eval") or {})
     step = int(ev.get("react_step", 0))
     docs = state.get("docs", []) or []
     snips = _ctx_snips(docs)
+
+    # ========== SAFETY CHECK 1: Don't process small talk ==========
+    if _is_smalltalk(q):
+        log.warning(f"[REACT] Small talk detected in react_loop! This should never happen. Query: '{q}'")
+        return {
+            "docs": [],
+            "eval": ev,
+            "trace": state.get("trace", []) + [f"react_step({step}) ABORTED - smalltalk detected"]
+        }
 
     raw = generate_text(
         REACT_STEP_PROMPT.format(question=q, snips=snips),
@@ -561,7 +646,20 @@ def react_loop_node(state: ChatState) -> Dict:
     action = (action or "search").strip().lower()
     if action not in ("search", "finish"):
         action = "search"
+    
+    # ========== SAFETY CHECK 2: Validate subquery makes sense ==========
     subq = (subq_extracted or q).strip() or q
+    
+    # If subquery was extracted, check it has word overlap with original
+    if subq_extracted and subq_extracted != q:
+        original_words = set(re.findall(r'\w+', q.lower()))
+        subq_words = set(re.findall(r'\w+', subq.lower()))
+        overlap = len(original_words & subq_words)
+        
+        # If no word overlap, likely hallucinated - use original query
+        if overlap == 0 and len(original_words) > 0:
+            log.warning(f"[REACT] Subquery has no overlap with original. Using original. Original: '{q}', Subquery: '{subq}'")
+            subq = q
 
     if (step < AGENT_MIN_STEPS) or (AGENT_FORCE_FIRST_SEARCH and step == 0 and action != "search"):
         action = "search"
@@ -662,15 +760,9 @@ def route_rerank(state: ChatState) -> str:
 
 # ===================== LLM (final answer) =====================
 def llm_node(state: ChatState) -> Dict:
-    """
-    FIXED: Handles both RAG queries and greetings gracefully.
-    For greetings, context will be empty and ask_secure will handle it naturally.
-    """
     docs = state.get("docs", [])
     role = (state.get("eval") or {}).get("role") or DEFAULT_ROLE
-    q = state["query"]
     
-    # If no docs found, provide helpful troubleshooting message
     if not docs:
         msg = (
             f"No evidence found in Qdrant collection '{QDRANT_COLLECTION}'. I won't fabricate an answer.\n\n"
@@ -682,8 +774,7 @@ def llm_node(state: ChatState) -> Dict:
         return {"messages":[AIMessage(content=msg)], "answer": msg,
                 "trace": state.get("trace", []) + ["llm(NO_CONTEXT)"]}
 
-    # Normal RAG path: format context and call ask_secure
-    text = ask_secure(q, context=_fmt_ctx(docs, cap=12), role=role,
+    text = ask_secure(state["query"], context=_fmt_ctx(docs, cap=12), role=role,
                       preset="factual", max_new_tokens=400)
     return {"messages": [AIMessage(content=text)], "answer": text, "trace": state.get("trace", []) + ["llm"]}
 
@@ -698,11 +789,11 @@ state_graph.add_node("llm",           llm_node)
 
 state_graph.add_edge(START, "orchestrator")
 
-# CRITICAL FIX: Add "end" route that goes directly to END
+# CRITICAL FIX: Add "end" route that goes directly to END for small talk
 state_graph.add_conditional_edges("orchestrator", route_orchestrator, {
     "react": "react_loop",
     "self_ask": "self_ask_loop",
-    "end": END,  # NEW: Direct exit for greetings/goodbyes
+    "end": END,  # Direct exit for greetings/goodbyes/thanks
 })
 
 state_graph.add_edge("react_loop", "rerank")
@@ -716,52 +807,65 @@ state_graph.add_edge("llm", END)
 
 graph = state_graph.compile()
 
-# ===================== MAIN ENTRY POINT =====================
-def chat_with_greeting_check(
-    query: str,
-    messages: Optional[List[AnyMessage]] = None,
-) -> Dict[str, Any]:
+# ===================== CRITICAL: Export with greeting pre-check =====================
+def chat_with_greeting_precheck(query: str, **kwargs):
     """
-    CRITICAL: Main entry point with double-layer protection for greetings/goodbyes.
+    CRITICAL WRAPPER: Check for small talk BEFORE invoking graph.
+    This is the FIRST line of defense and ensures instant responses.
     
-    Layer 1 (Fast Path): Pre-graph check - catches greetings before graph execution
-    Layer 2 (Graph Safety): orchestrator_node also checks and sets skip_rag flag
-    
-    This ensures greetings NEVER trigger RAG retrieval or LLM calls.
+    Use this function as your main entry point instead of graph.invoke()
     """
-    q = (query or "").strip()
-    base_msgs = list(messages or [])
-
-    # Layer 1: Pre-graph fast path (first line of defense)
+    q = query.strip()
+    
+    log.info(f"[PRE-CHECK] Query: '{q}'")
+    
+    # Fast-path Layer 1: Greetings
     if _is_greeting(q):
-        log.info("[FAST_PATH] Greeting detected - skipping graph entirely")
+        log.info("[PRE-CHECK] ✅ GREETING - fast path")
         return {
-            "messages": base_msgs + [HumanMessage(content=q), AIMessage(content=GREETING_REPLY)],
+            "messages": [HumanMessage(content=q), AIMessage(content=GREETING_REPLY)],
             "answer": GREETING_REPLY,
             "query": q,
             "intent": "greeting",
             "docs": [],
-            "eval": {"intent": "greeting", "preanswered": True},
-            "trace": ["fast_path_greeting"],
+            "eval": {"intent": "greeting", "skip_reason": "pre_check"},
+            "trace": ["pre_check_greeting"]
         }
-
+    
+    # Fast-path Layer 2: Goodbyes
     if _is_goodbye(q):
-        log.info("[FAST_PATH] Goodbye detected - skipping graph entirely")
+        log.info("[PRE-CHECK] ✅ GOODBYE - fast path")
         return {
-            "messages": base_msgs + [HumanMessage(content=q), AIMessage(content=GOODBYE_REPLY)],
+            "messages": [HumanMessage(content=q), AIMessage(content=GOODBYE_REPLY)],
             "answer": GOODBYE_REPLY,
             "query": q,
             "intent": "goodbye",
             "docs": [],
-            "eval": {"intent": "goodbye", "preanswered": True},
-            "trace": ["fast_path_goodbye"],
+            "eval": {"intent": "goodbye", "skip_reason": "pre_check"},
+            "trace": ["pre_check_goodbye"]
         }
-
-    # Layer 2: Normal path through graph (has built-in greeting detection too)
-    log.info("[NORMAL_PATH] Non-greeting query - invoking full RAG graph")
-    initial_state: Dict[str, Any] = {
+    
+    # Fast-path Layer 3: Thanks
+    if _is_thanks(q):
+        log.info("[PRE-CHECK] ✅ THANKS - fast path")
+        return {
+            "messages": [HumanMessage(content=q), AIMessage(content=THANKS_REPLY)],
+            "answer": THANKS_REPLY,
+            "query": q,
+            "intent": "thanks",
+            "docs": [],
+            "eval": {"intent": "thanks", "skip_reason": "pre_check"},
+            "trace": ["pre_check_thanks"]
+        }
+    
+    # Normal path: invoke graph for technical queries
+    log.info("[PRE-CHECK] Technical query - invoking graph")
+    initial_state = {
         "query": q,
-        "messages": base_msgs + [HumanMessage(content=q)],
-        "trace": [],
+        "messages": [HumanMessage(content=q)],
+        "trace": []
     }
     return graph.invoke(initial_state)
+
+# For backward compatibility, but recommend using chat_with_greeting_precheck
+__all__ = ["graph", "chat_with_greeting_precheck", "hybrid_search"]
